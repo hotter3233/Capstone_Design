@@ -1,0 +1,20 @@
+# 파이썬 컴파일/캐시 파일 (스크린샷에 보이던 것들)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 가상환경 (용량이 크고 각자 PC 환경이 다르므로 올리지 않음)
+venv/
+.venv/
+env/
+
+# 환경 변수 및 비밀번호 (보안 중요!)
+.env
+
+# 운영체제 생성 파일
+.DS_Store
+Thumbs.db
+
+# VS Code 설정
+.vscode/
