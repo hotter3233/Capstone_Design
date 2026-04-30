@@ -19,21 +19,87 @@ class EvalResult:
     side: str = "Unknown"
 
 def check_visibility(pts, threshold=0.5):
+    """주요 관절 가시성 확인 (의도적 설계: index 제외)"""
     for key in ['shoulder', 'elbow', 'wrist', 'hip']:
         if pts[key][3] < threshold: return False
     return True
 
-def eval_side(engine, p_world, hand_landmarks, load_kg) -> EvalResult:
+
+def calculate_hybrid_neck_angle(pts_n_l, pts_n_r):
+    
+    #양쪽 관절이 완벽히 보일 땐 '3D 중심축 투영'을, 가려짐이 발생하면 '단일 측면 YZ 투영'을 사용
+    
+    STRICT_THRESH = 0.85 # 가시성 기준
+    
+    # 귀(Ear)의 가시성도 중요하므로 조건에 추가
+    left_vis = pts_n_l['shoulder'][3] > STRICT_THRESH and pts_n_l['hip'][3] > STRICT_THRESH and pts_n_l['ear'][3] > STRICT_THRESH
+    right_vis = pts_n_r['shoulder'][3] > STRICT_THRESH and pts_n_r['hip'][3] > STRICT_THRESH and pts_n_r['ear'][3] > STRICT_THRESH
+    
+    #  MODE 1: 정면/대각선 (양쪽이 다 잘 보임) -> 3D 중심축 로직 가동
+    if left_vis and right_vis:
+        # 1. 뼈대 중심점 계산 
+        ear_l, ear_r = np.array(pts_n_l['ear'][:3]), np.array(pts_n_r['ear'][:3])
+        sh_l, sh_r = np.array(pts_n_l['shoulder'][:3]), np.array(pts_n_r['shoulder'][:3])
+        hip_l, hip_r = np.array(pts_n_l['hip'][:3]), np.array(pts_n_r['hip'][:3])
+        
+        head_anchor = (ear_l + ear_r) / 2.0
+        shoulder_center = (sh_l + sh_r) / 2.0
+        torso_center = (hip_l + hip_r) / 2.0
+        
+        # 2. 3D 벡터 정의
+        shoulder_line = sh_r - sh_l
+        shoulder_line = shoulder_line / (np.linalg.norm(shoulder_line) + 1e-6)
+        
+        torso_axis = shoulder_center - torso_center
+        neck_axis = head_anchor - shoulder_center
+        
+        # 3. 어깨선을 기준축으로 직교 투영 
+        def project_perpendicular(v, normal):
+            return v - normal * np.dot(v, normal)
+            
+        torso_in_plane = project_perpendicular(torso_axis, shoulder_line)
+        neck_in_plane = project_perpendicular(neck_axis, shoulder_line)
+        
+        # 4. 투영된 척추와 목 벡터 간의 각도 도출
+        t_norm = np.linalg.norm(torso_in_plane) + 1e-6
+        n_norm = np.linalg.norm(neck_in_plane) + 1e-6
+        
+        cosine_angle = np.dot(torso_in_plane / t_norm, neck_in_plane / n_norm)
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        return np.degrees(angle)
+
+    #  MODE 2: 측면 (한쪽이 가려짐) ->  YZ 투영망
+    active_pts = pts_n_l if left_vis else pts_n_r if right_vis else None
+    
+    if not active_pts: # 둘 다 STRICT를 못 넘었지만 기본(0.5)은 넘는 쪽
+        if pts_n_l['shoulder'][3] > 0.5: active_pts = pts_n_l
+        elif pts_n_r['shoulder'][3] > 0.5: active_pts = pts_n_r
+
+    if active_pts:
+        ear = active_pts['ear']
+        shoulder = active_pts['shoulder']
+        shoulder_up = [shoulder[0], shoulder[1] - 0.5, shoulder[2]]
+        return calculate_angle_projected(ear, shoulder, shoulder_up, plane='YZ')
+        
+    return 0.0
+
+
+def eval_side(engine, p_world, hand_landmarks, load_kg, pts_n_l=None, pts_n_r=None) -> EvalResult:
     shoulder, elbow, wrist = p_world['shoulder'], p_world['elbow'], p_world['wrist']
     hip, ear, index = p_world['hip'], p_world['ear'], p_world['index']
 
-    shoulder_up = [shoulder[0], shoulder[1] - 0.5, shoulder[2]]   
     shoulder_down = [shoulder[0], shoulder[1] + 0.5, shoulder[2]] 
     hip_up = [hip[0], hip[1] - 0.5, hip[2]]                       
 
     ua = calculate_angle_3d(elbow, shoulder, shoulder_down)
     tr = calculate_angle_projected(shoulder, hip, hip_up, plane='YZ')
-    nk = calculate_angle_projected(ear, shoulder, shoulder_up, plane='YZ')
+    
+    #  하이브리드 목 각도 호출
+    if pts_n_l and pts_n_r:
+        nk = calculate_hybrid_neck_angle(pts_n_l, pts_n_r)
+    else:
+        shoulder_up = [shoulder[0], shoulder[1] - 0.5, shoulder[2]]
+        nk = calculate_angle_projected(ear, shoulder, shoulder_up, plane='YZ')
     
     la_raw = calculate_angle_3d(shoulder, elbow, wrist)
     la = 180 - la_raw if la_raw else 0
@@ -84,7 +150,6 @@ def generate_final_report(res, engine, leg_score, load_kg, worst_img, worst_sec,
     if not res["sec"]: 
         return {"summary": {"score": 1, "action": "데이터 없음", "total": 0}, "ts": res, "worst": {"img": None, "sec": 0, "score": 0}}
 
-    # 모든 점수가 동일할 때를 위한 엣지 케이스 보호
     if len(set(res["rula"])) == 1:
         top_indices = list(range(len(res["rula"])))
     else:
@@ -181,8 +246,10 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                 w_lms = out.pose_world_landmarks.landmark 
                 n_lms = out.pose_landmarks.landmark       
                 
-                pts_w_l = extract_3d_pts(w_lms, "left"); pts_n_l = extract_3d_pts(n_lms, "left")
-                pts_w_r = extract_3d_pts(w_lms, "right"); pts_n_r = extract_3d_pts(n_lms, "right")
+                pts_w_l = extract_3d_pts(w_lms, "left")
+                pts_n_l = extract_3d_pts(n_lms, "left")
+                pts_w_r = extract_3d_pts(w_lms, "right")
+                pts_n_r = extract_3d_pts(n_lms, "right")
                 
                 vis_l, vis_r = check_visibility(pts_n_l), check_visibility(pts_n_r)
                 
@@ -197,10 +264,12 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                         continue 
                 else:
                     missing_count = 0
-                    eval_l = eval_side(engine, pts_w_l, out.left_hand_landmarks, load_kg) if vis_l else None
+                    
+                    
+                    eval_l = eval_side(engine, pts_w_l, out.left_hand_landmarks, load_kg, pts_n_l, pts_n_r) if vis_l else None
                     if eval_l: eval_l.side = "Left"
                     
-                    eval_r = eval_side(engine, pts_w_r, out.right_hand_landmarks, load_kg) if vis_r else None
+                    eval_r = eval_side(engine, pts_w_r, out.right_hand_landmarks, load_kg, pts_n_l, pts_n_r) if vis_r else None
                     if eval_r: eval_r.side = "Right"
                     
                     if eval_l and eval_r:
