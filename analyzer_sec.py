@@ -1,8 +1,9 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import copy 
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, deque 
 from utils import calculate_angle_3d, calculate_angle_projected, extract_3d_pts, check_repetition, check_static, calculate_wrist_twist
 from rula_engine import RULAEngine
 
@@ -219,7 +220,9 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
     max_s, worst_img, worst_sec = -1, None, 0
     engine = RULAEngine()
     
-    last_valid = None
+    #  [추가] 과거 데이터를 기억할 버퍼 생성 (최대 3개 유지)
+    history = deque(maxlen=3)
+    
     last_valid_pts = None 
     has_data, missing_count = False, 0
     f_idx = 0
@@ -253,18 +256,40 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                 
                 vis_l, vis_r = check_visibility(pts_n_l), check_visibility(pts_n_r)
                 
+                #  상체가 가려졌을 때: 궤적 예측 로직 발동
                 if not vis_l and not vis_r:
                     missing_count += 1
-                    if has_data and missing_count <= 3 and last_valid is not None:
-                        eval_res = last_valid
+                    
+                    if has_data and missing_count <= 3 and len(history) > 0:
+                        # 1. 깊은 복사(Deep Copy)를 통해 원본 메모리 오염 방지
+                        eval_res = copy.deepcopy(history[-1])
+                        
+                        # 2. 버퍼에 데이터가 2개 이상 있다면 속도(Velocity)를 계산하여 각도 예측
+                        if len(history) >= 2:
+                            prev1 = history[-1] # 직전 데이터
+                            prev2 = history[-2] # 그 전 데이터
+                            
+                            # 예측된 미래 각도 = 현재 각도 + (가속도 * 가려진 누적 횟수)
+                            eval_res.trunk += (prev1.trunk - prev2.trunk) * missing_count
+                            eval_res.lower_arm += (prev1.lower_arm - prev2.lower_arm) * missing_count
+                            eval_res.neck += (prev1.neck - prev2.neck) * missing_count
+                            eval_res.wrist += (prev1.wrist - prev2.wrist) * missing_count
+                            eval_res.upper_arm += (prev1.upper_arm - prev2.upper_arm) * missing_count
+                            
+                            # (안전망) 물리적으로 불가능한 각도 클리핑 방어
+                            eval_res.lower_arm = max(0.0, min(180.0, eval_res.lower_arm))
+                            eval_res.wrist = max(0.0, min(180.0, eval_res.wrist))
+                            eval_res.upper_arm = max(0.0, min(180.0, eval_res.upper_arm))
+                            
                         draw_pts = last_valid_pts
                         is_hold_frame = True 
                     else:
                         has_data = False
                         continue 
+                        
+                #  정상적으로 가시성이 확보되었을 때
                 else:
                     missing_count = 0
-                    
                     
                     eval_l = eval_side(engine, pts_w_l, out.left_hand_landmarks, load_kg, pts_n_l, pts_n_r) if vis_l else None
                     if eval_l: eval_l.side = "Left"
@@ -278,7 +303,9 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                     elif eval_l: eval_res, draw_pts = eval_l, pts_n_l
                     else: eval_res, draw_pts = eval_r, pts_n_r
                     
-                    last_valid, last_valid_pts = eval_res, draw_pts
+                    #  [추가] 정상 평가가 끝나면 결과를 메모리에 밀어 넣음
+                    history.append(eval_res)
+                    last_valid_pts = draw_pts
                     has_data = True
                 
                 if eval_res is not None:
