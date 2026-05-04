@@ -332,6 +332,5 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
     finally:
         cap.release()
         holistic.close()
-        
-    
+            
     return generate_final_report(res, engine, leg_score, load_kg, worst_img, worst_sec, max_s)
