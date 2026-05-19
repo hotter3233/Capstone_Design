@@ -27,18 +27,15 @@ def check_visibility(pts, threshold=0.5):
 
 
 def calculate_hybrid_neck_angle(pts_n_l, pts_n_r):
-    
-    #양쪽 관절이 완벽히 보일 땐 '3D 중심축 투영'을, 가려짐이 발생하면 '단일 측면 YZ 투영'을 사용
-    
+    # 양쪽 관절이 완벽히 보일 땐 '3D 중심축 투영'을, 가려짐이 발생하면 '단일 측면 YZ 투영'을 사용
     STRICT_THRESH = 0.85 # 가시성 기준
     
     # 귀(Ear)의 가시성도 중요하므로 조건에 추가
     left_vis = pts_n_l['shoulder'][3] > STRICT_THRESH and pts_n_l['hip'][3] > STRICT_THRESH and pts_n_l['ear'][3] > STRICT_THRESH
     right_vis = pts_n_r['shoulder'][3] > STRICT_THRESH and pts_n_r['hip'][3] > STRICT_THRESH and pts_n_r['ear'][3] > STRICT_THRESH
     
-    #  MODE 1: 정면/대각선 (양쪽이 다 잘 보임) -> 3D 중심축 로직 가동
+    # MODE 1: 정면/대각선 (양쪽이 다 잘 보임) -> 3D 중심축 로직 가동
     if left_vis and right_vis:
-        # 1. 뼈대 중심점 계산 
         ear_l, ear_r = np.array(pts_n_l['ear'][:3]), np.array(pts_n_r['ear'][:3])
         sh_l, sh_r = np.array(pts_n_l['shoulder'][:3]), np.array(pts_n_r['shoulder'][:3])
         hip_l, hip_r = np.array(pts_n_l['hip'][:3]), np.array(pts_n_r['hip'][:3])
@@ -47,21 +44,18 @@ def calculate_hybrid_neck_angle(pts_n_l, pts_n_r):
         shoulder_center = (sh_l + sh_r) / 2.0
         torso_center = (hip_l + hip_r) / 2.0
         
-        # 2. 3D 벡터 정의
         shoulder_line = sh_r - sh_l
         shoulder_line = shoulder_line / (np.linalg.norm(shoulder_line) + 1e-6)
         
         torso_axis = shoulder_center - torso_center
         neck_axis = head_anchor - shoulder_center
         
-        # 3. 어깨선을 기준축으로 직교 투영 
         def project_perpendicular(v, normal):
             return v - normal * np.dot(v, normal)
             
         torso_in_plane = project_perpendicular(torso_axis, shoulder_line)
         neck_in_plane = project_perpendicular(neck_axis, shoulder_line)
         
-        # 4. 투영된 척추와 목 벡터 간의 각도 도출
         t_norm = np.linalg.norm(torso_in_plane) + 1e-6
         n_norm = np.linalg.norm(neck_in_plane) + 1e-6
         
@@ -69,10 +63,10 @@ def calculate_hybrid_neck_angle(pts_n_l, pts_n_r):
         angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
         return np.degrees(angle)
 
-    #  MODE 2: 측면 (한쪽이 가려짐) ->  YZ 투영망
+    # MODE 2: 측면 (한쪽이 가려짐) -> YZ 투영망
     active_pts = pts_n_l if left_vis else pts_n_r if right_vis else None
     
-    if not active_pts: # 둘 다 STRICT를 못 넘었지만 기본(0.5)은 넘는 쪽
+    if not active_pts:
         if pts_n_l['shoulder'][3] > 0.5: active_pts = pts_n_l
         elif pts_n_r['shoulder'][3] > 0.5: active_pts = pts_n_r
 
@@ -93,20 +87,28 @@ def eval_side(engine, p_world, hand_landmarks, load_kg, pts_n_l=None, pts_n_r=No
     hip_up = [hip[0], hip[1] - 0.5, hip[2]]                       
 
     ua = calculate_angle_3d(elbow, shoulder, shoulder_down)
-    tr = calculate_angle_projected(shoulder, hip, hip_up, plane='YZ')
     
-    #  하이브리드 목 각도 호출
+    # 🔴 [튜닝 1] 허리 데드존: 인체의 자연스러운 5도 굽힘은 무시
+    tr_raw = calculate_angle_projected(shoulder, hip, hip_up, plane='YZ')
+    tr = max(0.0, tr_raw - 5.0) 
+    
+    # 🔴 [튜닝 1] 목 데드존: 인체의 자연스러운 5도 굽힘 무시
     if pts_n_l and pts_n_r:
-        nk = calculate_hybrid_neck_angle(pts_n_l, pts_n_r)
+        nk_raw = calculate_hybrid_neck_angle(pts_n_l, pts_n_r)
     else:
         shoulder_up = [shoulder[0], shoulder[1] - 0.5, shoulder[2]]
-        nk = calculate_angle_projected(ear, shoulder, shoulder_up, plane='YZ')
+        nk_raw = calculate_angle_projected(ear, shoulder, shoulder_up, plane='YZ')
+    nk = max(0.0, nk_raw - 5.0)
     
     la_raw = calculate_angle_3d(shoulder, elbow, wrist)
     la = 180 - la_raw if la_raw else 0
     
     wr_raw = calculate_angle_3d(elbow, wrist, index)
     wr_internal = 180 - wr_raw if wr_raw else 0
+    
+    # 🔴 [튜닝 2] 손목 가짜 꺾임 방어: 손가락에 힘을 뺀 자연스러운 15도 이하 처짐은 무시
+    if wr_internal < 15.0:
+        wr_internal = 0.0
     
     if load_kg > 0 and wr_internal > 30:
         wr = 30 + (wr_internal - 30) * 0.2
@@ -115,13 +117,15 @@ def eval_side(engine, p_world, hand_landmarks, load_kg, pts_n_l=None, pts_n_r=No
 
     w_t = calculate_wrist_twist(hand_landmarks)
     
-    is_neck_twisted = abs(ear[2] - shoulder[2]) > 0.20
-    is_trunk_twisted = abs(shoulder[2] - hip[2]) > 0.25
-    is_wrist_deviated = abs(index[0] - wrist[0]) > 0.15
+    # 🔴 [튜닝 3] 비틀림 및 들림 페널티(Flags) Z축 임계값 대폭 완화
+    is_neck_twisted = abs(ear[2] - shoulder[2]) > 0.28   # 0.20 -> 0.28
+    is_trunk_twisted = abs(shoulder[2] - hip[2]) > 0.35  # 0.25 -> 0.35
+    is_wrist_deviated = abs(index[0] - wrist[0]) > 0.20  # 0.15 -> 0.20
+    is_arm_abducted = abs(elbow[0] - shoulder[0]) > 0.25 # 0.20 -> 0.25
     
-    is_arm_abducted = abs(elbow[0] - shoulder[0]) > 0.20
     ear_shoulder_dist = np.linalg.norm(np.array(ear[:3]) - np.array(shoulder[:3]))
-    is_shoulder_raised = ear_shoulder_dist < 0.15 
+    is_shoulder_raised = ear_shoulder_dist < 0.10        # 0.15 -> 0.10 (기준 완화)
+    
     is_upper_arm_penalty = is_arm_abducted or is_shoulder_raised
     
     u_s = engine.get_upper_arm_score(ua, is_abducted_or_raised=is_upper_arm_penalty)
@@ -213,14 +217,15 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
     cap = cv2.VideoCapture(video_path)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
-    interval = max(int(fps), 1) if fps > 0 else 30
+    
+    # 🔴 [최적화] 0.5초(초당 2프레임) 단위 추출로 예측 정확도 극대화
+    interval = max(int(fps / 2), 1) if fps > 0 else 15
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     res = {"sec": [], "trunk": [], "elbow": [], "upper_arm": [], "neck": [], "wrist": [], "twist": [], "rula": [], "flags": [], "side": []}
     max_s, worst_img, worst_sec = -1, None, 0
     engine = RULAEngine()
     
-    #  [추가] 과거 데이터를 기억할 버퍼 생성 (최대 3개 유지)
     history = deque(maxlen=3)
     
     last_valid_pts = None 
@@ -239,7 +244,7 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
             
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             out = holistic.process(rgb)
-            curr_sec = f_idx // interval
+            curr_sec = f_idx / (fps if fps > 0 else 30.0) # 실제 시간(초) 기록 최적화
             
             is_hold_frame = False 
             eval_res = None
@@ -256,27 +261,23 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                 
                 vis_l, vis_r = check_visibility(pts_n_l), check_visibility(pts_n_r)
                 
-                #  상체가 가려졌을 때: 궤적 예측 로직 발동
                 if not vis_l and not vis_r:
                     missing_count += 1
                     
-                    if has_data and missing_count <= 3 and len(history) > 0:
-                        # 1. 깊은 복사(Deep Copy)를 통해 원본 메모리 오염 방지
+                    # 🔴 [최적화] 0.5초 간격이므로 방어 횟수를 6번(최대 3초)으로 연장
+                    if has_data and missing_count <= 6 and len(history) > 0:
                         eval_res = copy.deepcopy(history[-1])
                         
-                        # 2. 버퍼에 데이터가 2개 이상 있다면 속도(Velocity)를 계산하여 각도 예측
                         if len(history) >= 2:
-                            prev1 = history[-1] # 직전 데이터
-                            prev2 = history[-2] # 그 전 데이터
+                            prev1 = history[-1]
+                            prev2 = history[-2]
                             
-                            # 예측된 미래 각도 = 현재 각도 + (가속도 * 가려진 누적 횟수)
                             eval_res.trunk += (prev1.trunk - prev2.trunk) * missing_count
                             eval_res.lower_arm += (prev1.lower_arm - prev2.lower_arm) * missing_count
                             eval_res.neck += (prev1.neck - prev2.neck) * missing_count
                             eval_res.wrist += (prev1.wrist - prev2.wrist) * missing_count
                             eval_res.upper_arm += (prev1.upper_arm - prev2.upper_arm) * missing_count
                             
-                            # (안전망) 물리적으로 불가능한 각도 클리핑 방어
                             eval_res.lower_arm = max(0.0, min(180.0, eval_res.lower_arm))
                             eval_res.wrist = max(0.0, min(180.0, eval_res.wrist))
                             eval_res.upper_arm = max(0.0, min(180.0, eval_res.upper_arm))
@@ -287,10 +288,8 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                         has_data = False
                         continue 
                         
-                #  정상적으로 가시성이 확보되었을 때
                 else:
                     missing_count = 0
-                    
                     eval_l = eval_side(engine, pts_w_l, out.left_hand_landmarks, load_kg, pts_n_l, pts_n_r) if vis_l else None
                     if eval_l: eval_l.side = "Left"
                     
@@ -303,13 +302,12 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                     elif eval_l: eval_res, draw_pts = eval_l, pts_n_l
                     else: eval_res, draw_pts = eval_r, pts_n_r
                     
-                    #  [추가] 정상 평가가 끝나면 결과를 메모리에 밀어 넣음
                     history.append(eval_res)
                     last_valid_pts = draw_pts
                     has_data = True
                 
                 if eval_res is not None:
-                    res["sec"].append(curr_sec)
+                    res["sec"].append(round(curr_sec, 2)) # 소수점 둘째 자리로 깔끔하게 정리
                     res["trunk"].append(eval_res.trunk)
                     res["elbow"].append(eval_res.lower_arm) 
                     res["upper_arm"].append(eval_res.upper_arm)
@@ -321,7 +319,7 @@ def analyze_video_per_second(video_path, load_kg=0, leg_score=1):
                     res["side"].append(eval_res.side)
                     
                     if not is_hold_frame and eval_res.rula_score > max_s:
-                        max_s, worst_sec = eval_res.rula_score, curr_sec
+                        max_s, worst_sec = eval_res.rula_score, round(curr_sec, 2)
                         tmp = frame.copy()
                         h, w, _ = frame.shape
                         for p1, p2 in [('shoulder', 'elbow'), ('elbow', 'wrist'), ('wrist', 'index'), ('ear', 'shoulder'), ('shoulder', 'hip')]:
